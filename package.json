@@ -1,0 +1,195 @@
+"""
+Tests for tasks.py DB helper functions — mock psycopg2 at the boundary.
+
+These tests verify that the correct SQL is executed with the correct
+parameters and that context managers are used properly. No real DB needed.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from unittest.mock import MagicMock, call, patch, ANY
+
+import pytest
+
+
+class TestSyncUpdateRun:
+    """_sync_update_run writes the correct UPDATE statement."""
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_updates_correct_columns(self, mock_connect):
+        from app.workers.tasks import _sync_update_run
+
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__  = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__  = MagicMock(return_value=False)
+
+        run_id = str(uuid.uuid4())
+        _sync_update_run(run_id, status="running", resources_found=5)
+
+        mock_cur.execute.assert_called_once()
+        sql, params = mock_cur.execute.call_args[0]
+        assert "UPDATE policy_runs" in sql
+        assert "status = %s" in sql
+        assert "resources_found = %s" in sql
+        assert "running" in params
+        assert 5 in params
+        assert run_id in params
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_logs_error_on_db_failure(self, mock_connect, caplog):
+        import psycopg2
+        from app.workers.tasks import _sync_update_run
+
+        mock_connect.side_effect = psycopg2.OperationalError("connection refused")
+
+        with caplog.at_level("ERROR"):
+            _sync_update_run("some-id", status="failed")
+
+        assert "DB update failed" in caplog.text
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_uses_context_manager(self, mock_connect):
+        """Verify the connection is opened via 'with' (context manager protocol)."""
+        from app.workers.tasks import _sync_update_run
+
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=MagicMock())
+        mock_cm.__exit__  = MagicMock(return_value=False)
+        mock_connect.return_value = mock_cm
+
+        # Even if cursor raises, __exit__ must be called
+        mock_cm.__enter__.return_value.cursor.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_cm.__enter__.return_value.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        _sync_update_run("test-id", status="running")
+        mock_cm.__exit__.assert_called_once()
+
+
+class TestSyncInsertWasteResources:
+    """_sync_insert_waste_resources inserts each resource with correct data."""
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_inserts_correct_number_of_rows(self, mock_connect):
+        from app.workers.tasks import _sync_insert_waste_resources
+
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__  = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__  = MagicMock(return_value=False)
+
+        resources = [
+            {"id": f"/rg/r{i}", "name": f"r{i}", "type": "Microsoft.Compute/disks",
+             "location": "westeurope", "properties": {"diskSizeGB": 50}}
+            for i in range(3)
+        ]
+
+        _sync_insert_waste_resources(
+            str(uuid.uuid4()), "sub-123", resources, "orphaned-disk", "orphaned", "high"
+        )
+
+        assert mock_cur.execute.call_count == 3
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_empty_resources_skips_db(self, mock_connect):
+        from app.workers.tasks import _sync_insert_waste_resources
+        _sync_insert_waste_resources(str(uuid.uuid4()), "sub", [], "p", "idle", "low")
+        mock_connect.assert_not_called()
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_resource_group_parsed_from_id(self, mock_connect):
+        from app.workers.tasks import _sync_insert_waste_resources
+
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__  = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__  = MagicMock(return_value=False)
+
+        resources = [{
+            "id": "/subscriptions/sub1/resourceGroups/my-rg/providers/Microsoft.Compute/disks/d1",
+            "name": "d1",
+            "type": "Microsoft.Compute/disks",
+            "location": "uksouth",
+            "properties": {"diskSizeGB": 100},
+        }]
+
+        _sync_insert_waste_resources(
+            str(uuid.uuid4()), "sub-1", resources, "orphaned-disk", "orphaned", "medium"
+        )
+
+        _, params = mock_cur.execute.call_args[0]
+        # resource_group is 6th positional param in the INSERT
+        assert "my-rg" in params
+
+
+class TestTriggerScheduledPolicies:
+    """trigger_scheduled_policies queries DB and dispatches exactly one task."""
+
+    @patch("app.workers.tasks.run_policy_set")
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_dispatches_single_task(self, mock_connect, mock_task):
+        from app.workers.tasks import trigger_scheduled_policies
+
+        pol_id = str(uuid.uuid4())
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__  = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__  = MagicMock(return_value=False)
+
+        # First fetchall = policies, second = subscriptions
+        mock_cur.fetchall.side_effect = [
+            [(pol_id, "idle-vm", "azure.vm", "idle", "high", "policies:\n  - name: p\n")],
+            [("sub-111", "Prod", "tenant-aaa")],
+        ]
+
+        trigger_scheduled_policies(["idle"])
+
+        mock_task.apply_async.assert_called_once()
+        args = mock_task.apply_async.call_args
+        assert args[1]["queue"] == "policy-runs"
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_no_policies_skips_dispatch(self, mock_connect):
+        from app.workers.tasks import trigger_scheduled_policies
+
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__  = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__  = MagicMock(return_value=False)
+        mock_cur.fetchall.side_effect = [[], [("sub-111", "Prod", "t")]]
+
+        with patch("app.workers.tasks.run_policy_set") as mock_task:
+            trigger_scheduled_policies(["idle"])
+            mock_task.apply_async.assert_not_called()
+
+    @patch("app.workers.tasks.psycopg2.connect")
+    def test_no_subscriptions_skips_dispatch(self, mock_connect):
+        from app.workers.tasks import trigger_scheduled_policies
+
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect.return_value.__exit__  = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__  = MagicMock(return_value=False)
+        pol_id = str(uuid.uuid4())
+        mock_cur.fetchall.side_effect = [
+            [(pol_id, "p", "azure.vm", "idle", "high", "yaml")],
+            [],
+        ]
+
+        with patch("app.workers.tasks.run_policy_set") as mock_task:
+            trigger_scheduled_policies(["idle"])
+            mock_task.apply_async.assert_not_called()

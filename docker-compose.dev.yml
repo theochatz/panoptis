@@ -1,0 +1,27 @@
+"""
+Pytest configuration and shared fixtures.
+
+Test strategy:
+  - Unit tests: pure Python, no I/O, no DB, no network. Fast.
+  - Integration tests: use an in-process SQLite/async DB or TestClient.
+  - DB-dependent tests are marked @pytest.mark.integration and skipped
+    unless a real Postgres URL is provided via TEST_DATABASE_URL.
+
+All external dependencies (psycopg2, azure SDK, subprocess) are mocked
+at the boundary so unit tests run in any environment without credentials.
+"""
+
+from __future__ import annotations
+
+import os
+import pytest
+
+# Point DATABASE_URL to an in-memory SQLite for integration tests
+# Override with a real Postgres URL for full integration coverage:
+#   TEST_DATABASE_URL=postgresql+asyncpg://... pytest -m integration
+os.environ.setdefault(
+    "DATABASE_URL",
+    "sqlite+aiosqlite:///./test.db",
+)
+os.environ.setdefault("CELERY_BROKER_URL",     "memory://")
+os.environ.setdefault("CELERY_RESULT_BACKEND", "cache+memory://")

@@ -1,0 +1,61 @@
+"""
+FastAPI application entry point.
+
+Security notes:
+  - CORS origins are read from the ALLOWED_ORIGINS env var (comma-separated).
+    Defaults to empty list — the API is internal to the AKS cluster and is
+    only exposed via the nginx-fronted frontend service.
+  - No auth middleware is included here; internal-only deployment is the
+    current security boundary. Add Azure AD MSAL middleware before any
+    external exposure.
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.database import init_db
+from app.core.notify import start_listener, stop_listener
+from app.api import actions, analytics, health, policies, resources, runs, stream, subscriptions
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    await start_listener()   # begin LISTEN on Postgres "custodian" channel
+    yield
+    await stop_listener()    # graceful shutdown on pod termination
+
+
+app = FastAPI(
+    title="Azure Custodian Orchestrator",
+    version="1.0.0",
+    lifespan=lifespan,
+    # Disable docs in production — set DOCS_ENABLED=true to re-enable during development
+    docs_url="/docs" if os.getenv("DOCS_ENABLED") == "true" else None,
+    redoc_url="/redoc" if os.getenv("DOCS_ENABLED") == "true" else None,
+)
+
+# CORS: default to no external origins. Set ALLOWED_ORIGINS env var in development.
+# Example: ALLOWED_ORIGINS=http://localhost:5173,https://my-domain.com
+_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=bool(_origins),
+)
+
+app.include_router(health.router,         prefix="/health",            tags=["health"])
+app.include_router(subscriptions.router,  prefix="/api/subscriptions", tags=["subscriptions"])
+app.include_router(policies.router,       prefix="/api/policies",      tags=["policies"])
+app.include_router(runs.router,           prefix="/api/runs",          tags=["runs"])
+app.include_router(resources.router,      prefix="/api/resources",     tags=["resources"])
+app.include_router(analytics.router,      prefix="/api/analytics",     tags=["analytics"])
+app.include_router(actions.router,        prefix="/api/actions",       tags=["actions"])
+app.include_router(stream.router,         prefix="/api/stream",        tags=["stream"])

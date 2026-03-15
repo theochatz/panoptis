@@ -1,0 +1,140 @@
+"""
+Unit tests for notify.py — SSE broadcaster.
+
+Tests the subscribe/unsubscribe lifecycle, fan-out behaviour,
+and heartbeat generation. No real Postgres connection needed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import pytest
+
+
+class TestSubscribeUnsubscribe:
+    """Client queues are created and cleaned up correctly."""
+
+    @pytest.mark.asyncio
+    async def test_subscribe_creates_queue(self):
+        from app.core import notify
+        notify._clients.clear()
+
+        q = await notify.subscribe("client-1")
+        assert "client-1" in notify._clients
+        assert q is notify._clients["client-1"]
+
+    @pytest.mark.asyncio
+    async def test_unsubscribe_removes_client(self):
+        from app.core import notify
+        notify._clients.clear()
+
+        await notify.subscribe("client-2")
+        notify.unsubscribe("client-2")
+        assert "client-2" not in notify._clients
+
+    @pytest.mark.asyncio
+    async def test_unsubscribe_nonexistent_is_safe(self):
+        from app.core import notify
+        notify.unsubscribe("never-existed")   # must not raise
+
+
+class TestOnNotify:
+    """_on_notify fans out to all connected clients."""
+
+    @pytest.mark.asyncio
+    async def test_message_delivered_to_all_clients(self):
+        from app.core import notify
+        notify._clients.clear()
+
+        q1 = await notify.subscribe("c1")
+        q2 = await notify.subscribe("c2")
+
+        payload = '{"type":"run_updated","status":"completed"}'
+        notify._on_notify(None, 0, "custodian", payload)
+
+        assert q1.get_nowait() == payload
+        assert q2.get_nowait() == payload
+
+    @pytest.mark.asyncio
+    async def test_full_queue_does_not_raise(self):
+        """A slow client with a full queue should be skipped, not crash the broadcaster."""
+        from app.core import notify
+        notify._clients.clear()
+
+        q = await notify.subscribe("slow-client")
+        # Fill the queue to maxsize
+        for i in range(q.maxsize):
+            q.put_nowait(f"msg-{i}")
+
+        # Should not raise
+        notify._on_notify(None, 0, "custodian", "overflow-message")
+
+    @pytest.mark.asyncio
+    async def test_no_clients_no_error(self):
+        from app.core import notify
+        notify._clients.clear()
+        notify._on_notify(None, 0, "custodian", '{"type":"test"}')
+
+
+class TestPublish:
+    """publish() pushes directly to all clients without Postgres."""
+
+    @pytest.mark.asyncio
+    async def test_publish_reaches_all_clients(self):
+        from app.core import notify
+        notify._clients.clear()
+
+        q1 = await notify.subscribe("p1")
+        q2 = await notify.subscribe("p2")
+
+        await notify.publish("run_updated", {"status": "completed", "resources_found": 5})
+
+        msg1 = q1.get_nowait()
+        msg2 = q2.get_nowait()
+        import json
+        data = json.loads(msg1)
+        assert data["type"] == "run_updated"
+        assert data["resources_found"] == 5
+        assert msg1 == msg2
+
+
+class TestEventStream:
+    """event_stream yields SSE-formatted strings and heartbeats."""
+
+    @pytest.mark.asyncio
+    async def test_initial_connected_comment(self):
+        from app.core import notify
+        notify._clients.clear()
+
+        gen = notify.event_stream("stream-test")
+        first = await gen.__anext__()
+        assert first == ": connected\n\n"
+
+    @pytest.mark.asyncio
+    async def test_message_formatted_as_sse(self):
+        from app.core import notify
+        notify._clients.clear()
+
+        gen = notify.event_stream("stream-test-2")
+        await gen.__anext__()  # skip connected comment
+
+        # Put a message in the queue
+        q = notify._clients["stream-test-2"]
+        q.put_nowait('{"type":"run_updated"}')
+
+        msg = await gen.__anext__()
+        assert msg.startswith("data: ")
+        assert msg.endswith("\n\n")
+        assert '"type":"run_updated"' in msg
+
+    @pytest.mark.asyncio
+    async def test_client_cleaned_up_on_cancel(self):
+        from app.core import notify
+        notify._clients.clear()
+
+        gen = notify.event_stream("cancel-test")
+        await gen.__anext__()  # connected comment
+        assert "cancel-test" in notify._clients
+
+        await gen.aclose()
+        assert "cancel-test" not in notify._clients

@@ -1,0 +1,260 @@
+"""
+API integration tests using FastAPI TestClient with an in-memory SQLite DB.
+
+These tests verify that:
+  - HTTP status codes are correct for valid and invalid inputs
+  - UUID path params return 422 (not 500) when malformed
+  - Business rules (404 for missing records, 400 for bad requests) work
+  - Response shapes match the declared response_model
+
+FastAPI's TestClient runs synchronously against an ASGI app configured
+with a test SQLite database — no real Postgres or Celery needed.
+"""
+
+from __future__ import annotations
+
+import os
+import pytest
+import pytest_asyncio
+
+# Must be set before importing app modules
+os.environ["DATABASE_URL"]        = "sqlite+aiosqlite:///./test_api.db"
+os.environ["CELERY_BROKER_URL"]   = "memory://"
+os.environ["CELERY_RESULT_BACKEND"] = "cache+memory://"
+
+from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.core.database import Base, get_db, Policy, Subscription
+from app.main import app
+
+
+# ── Test DB setup ─────────────────────────────────────────────────────────────
+
+TEST_DB_URL = "sqlite+aiosqlite:///./test_api.db"
+test_engine = create_async_engine(TEST_DB_URL, echo=False)
+TestSessionLocal = sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def override_get_db():
+    async with TestSessionLocal() as session:
+        yield session
+
+
+@pytest.fixture(scope="module", autouse=True)
+def setup_test_db():
+    """Create tables once for the module, drop after."""
+    import asyncio
+
+    async def _setup():
+        async with test_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def _teardown():
+        async with test_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        import aiofiles.os as aio_os
+        if os.path.exists("test_api.db"):
+            os.remove("test_api.db")
+
+    asyncio.get_event_loop().run_until_complete(_setup())
+    app.dependency_overrides[get_db] = override_get_db
+    yield
+    asyncio.get_event_loop().run_until_complete(_teardown())
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client():
+    # Disable lifespan (avoids needing real Postgres LISTEN)
+    with TestClient(app, raise_server_exceptions=True) as c:
+        yield c
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+class TestHealth:
+    def test_health_returns_ok(self, client):
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+
+
+# ── Policies ──────────────────────────────────────────────────────────────────
+
+class TestPoliciesAPI:
+    def test_list_policies_empty(self, client):
+        r = client.get("/api/policies")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_create_policy_returns_201(self, client):
+        payload = {
+            "name": "test-policy",
+            "resource_type": "azure.vm",
+            "category": "idle",
+            "severity": "medium",
+            "yaml_content": "policies:\n  - name: test\n",
+        }
+        r = client.post("/api/policies", json=payload)
+        assert r.status_code == 201
+        data = r.json()
+        assert data["name"] == "test-policy"
+        assert "id" in data
+
+    def test_get_policy_bad_uuid_returns_422(self, client):
+        r = client.get("/api/policies/not-a-uuid")
+        assert r.status_code == 422
+
+    def test_get_policy_missing_returns_404(self, client):
+        r = client.get("/api/policies/9a2f8c1d-0001-0001-0001-000000000001")
+        assert r.status_code == 404
+
+    def test_delete_policy_bad_uuid_returns_422(self, client):
+        r = client.delete("/api/policies/bad-uuid")
+        assert r.status_code == 422
+
+    def test_toggle_policy_bad_uuid_returns_422(self, client):
+        r = client.patch("/api/policies/bad-uuid/toggle")
+        assert r.status_code == 422
+
+    def test_create_and_toggle_policy(self, client):
+        payload = {
+            "name": "toggle-test",
+            "resource_type": "azure.disk",
+            "category": "orphaned",
+            "severity": "high",
+            "yaml_content": "policies:\n  - name: t\n",
+            "enabled": True,
+        }
+        create_r = client.post("/api/policies", json=payload)
+        assert create_r.status_code == 201
+        policy_id = create_r.json()["id"]
+
+        toggle_r = client.patch(f"/api/policies/{policy_id}/toggle")
+        assert toggle_r.status_code == 200
+        assert toggle_r.json()["enabled"] is False
+
+        toggle_r2 = client.patch(f"/api/policies/{policy_id}/toggle")
+        assert toggle_r2.json()["enabled"] is True
+
+
+# ── Subscriptions ─────────────────────────────────────────────────────────────
+
+class TestSubscriptionsAPI:
+    def test_create_subscription_returns_201(self, client):
+        payload = {
+            "subscription_id": "9a2f8c1d-0001-0001-0001-000000000001",
+            "tenant_id":       "tenant00-0002-0002-0002-000000000002",
+            "name": "Prod West",
+        }
+        r = client.post("/api/subscriptions", json=payload)
+        assert r.status_code == 201
+        assert r.json()["name"] == "Prod West"
+
+    def test_create_subscription_bad_guid_returns_422(self, client):
+        payload = {
+            "subscription_id": "not-a-guid",
+            "tenant_id":       "tenant00-0002-0002-0002-000000000002",
+            "name": "Bad",
+        }
+        r = client.post("/api/subscriptions", json=payload)
+        assert r.status_code == 422
+
+    def test_toggle_subscription_missing_returns_404(self, client):
+        r = client.patch("/api/subscriptions/nonexistent-sub/toggle")
+        assert r.status_code == 404
+
+
+# ── Actions ───────────────────────────────────────────────────────────────────
+
+class TestActionsAPI:
+    def test_trigger_action_bad_uuid_returns_422(self, client):
+        r = client.post("/api/actions", json={"resource_db_id": "bad", "action_type": "delete"})
+        assert r.status_code == 422
+
+    def test_trigger_action_invalid_type_returns_422(self, client):
+        r = client.post("/api/actions", json={
+            "resource_db_id": "9a2f8c1d-0001-0001-0001-000000000001",
+            "action_type": "explode",
+        })
+        assert r.status_code == 422
+
+    def test_trigger_action_missing_resource_returns_404(self, client):
+        r = client.post("/api/actions", json={
+            "resource_db_id": "9a2f8c1d-0001-0001-0001-000000000001",
+            "action_type": "delete",
+        })
+        assert r.status_code == 404
+
+    def test_get_action_bad_uuid_returns_422(self, client):
+        r = client.get("/api/actions/not-a-uuid")
+        assert r.status_code == 422
+
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+
+class TestResourcesAPI:
+    def test_list_resources_empty(self, client):
+        r = client.get("/api/resources")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_exempt_bad_uuid_returns_422(self, client):
+        r = client.patch("/api/resources/bad-uuid/exempt")
+        assert r.status_code == 422
+
+    def test_exempt_missing_resource_returns_404(self, client):
+        r = client.patch("/api/resources/9a2f8c1d-0001-0001-0001-000000000001/exempt")
+        assert r.status_code == 404
+
+
+# ── Runs ──────────────────────────────────────────────────────────────────────
+
+class TestRunsAPI:
+    def test_get_run_bad_uuid_returns_422(self, client):
+        r = client.get("/api/runs/not-a-uuid")
+        assert r.status_code == 422
+
+    def test_get_run_missing_returns_404(self, client):
+        r = client.get("/api/runs/9a2f8c1d-0001-0001-0001-000000000001")
+        assert r.status_code == 404
+
+    def test_cancel_run_bad_uuid_returns_422(self, client):
+        r = client.delete("/api/runs/bad-uuid/cancel")
+        assert r.status_code == 422
+
+    def test_trigger_no_subscriptions_returns_400(self, client):
+        r = client.post("/api/runs/trigger", json={
+            "policy_ids": ["9a2f8c1d-0001-0001-0001-000000000001"]
+        })
+        assert r.status_code == 400
+
+    def test_trigger_bad_policy_uuid_returns_422(self, client):
+        r = client.post("/api/runs/trigger", json={"policy_ids": ["bad-uuid"]})
+        assert r.status_code == 422
+
+    def test_list_runs_empty(self, client):
+        r = client.get("/api/runs")
+        assert r.status_code == 200
+        assert r.json() == []
+
+
+# ── Analytics ─────────────────────────────────────────────────────────────────
+
+class TestAnalyticsAPI:
+    def test_summary_returns_zeros_on_empty_db(self, client):
+        r = client.get("/api/analytics/summary")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["total_waste_resources"] == 0
+        assert data["total_identified_waste_monthly"] == 0.0
+
+    def test_run_history_days_param_validated(self, client):
+        r = client.get("/api/analytics/run-history?days=999")
+        assert r.status_code == 422   # Query ge=1 le=365
+
+    def test_run_history_valid_days(self, client):
+        r = client.get("/api/analytics/run-history?days=7")
+        assert r.status_code == 200

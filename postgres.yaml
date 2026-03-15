@@ -1,0 +1,192 @@
+import { useQuery, useQueryClient } from 'react-query'
+import { fetchPolicies, createPolicy, updatePolicy, deletePolicy, togglePolicy } from '../../lib/api'
+import { useState } from 'react'
+import toast from 'react-hot-toast'
+import { Plus, Edit2, Trash2, ToggleLeft, ToggleRight, ChevronRight, X, Save } from 'lucide-react'
+
+const SEVERITY_CLASS = { low: 'badge-low', medium: 'badge-medium', high: 'badge-high', critical: 'badge-critical' }
+const CATEGORY_COLOR = { idle: 'var(--red)', orphaned: 'var(--amber)', 'right-size': 'var(--purple)', tagging: 'var(--accent)', storage: 'var(--green)' }
+
+const DEFAULT_YAML = `policies:
+  - name: my-policy
+    resource: azure.vm
+    filters:
+      - type: metric
+        name: Percentage CPU
+        aggregation: average
+        op: less-than
+        threshold: 5
+        timeframe: 168
+    actions:
+      - type: tag
+        tags:
+          custodian_status: "idle-notify"
+`
+
+const FORM_DEFAULTS = {
+  name: '', description: '', resource_type: 'azure.vm',
+  category: 'idle', severity: 'medium', yaml_content: DEFAULT_YAML,
+  enabled: true, schedule: '', grace_period_hours: 72,
+}
+
+export default function PoliciesPage() {
+  const qc = useQueryClient()
+  const { data: policies = [] } = useQuery('policies', fetchPolicies)
+  const [editing, setEditing] = useState(null)   // null | 'new' | policy object
+  const [form, setForm] = useState(FORM_DEFAULTS)
+  const [saving, setSaving] = useState(false)
+
+  const openNew  = () => { setForm(FORM_DEFAULTS); setEditing('new') }
+  const openEdit = (p) => { setForm({ ...p }); setEditing(p) }
+  const close    = () => setEditing(null)
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      if (editing === 'new') {
+        await createPolicy(form)
+        toast.success('Policy created')
+      } else {
+        await updatePolicy(editing.id, form)
+        toast.success('Policy updated')
+      }
+      qc.invalidateQueries('policies')
+      close()
+    } catch (e) { toast.error(e.response?.data?.detail || 'Save failed') }
+    finally { setSaving(false) }
+  }
+
+  const doDelete = async (id) => {
+    if (!confirm('Delete this policy?')) return
+    try { await deletePolicy(id); qc.invalidateQueries('policies'); toast.success('Deleted') }
+    catch { toast.error('Delete failed') }
+  }
+
+  const doToggle = async (id) => {
+    try { await togglePolicy(id); qc.invalidateQueries('policies') }
+    catch { toast.error('Toggle failed') }
+  }
+
+  const Field = ({ label, children }) => (
+    <div style={{ marginBottom: 14 }}>
+      <label>{label}</label>
+      {children}
+    </div>
+  )
+
+  return (
+    <div style={{ padding: '28px 32px', display: 'flex', gap: 24, height: 'calc(100vh - 0px)', overflow: 'hidden' }} className="fade-in">
+      {/* List */}
+      <div style={{ flex: 1, overflow: 'auto', minWidth: 0 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div>
+            <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 24, fontWeight: 700 }}>Policies</h1>
+            <p style={{ color: 'var(--text-2)', fontSize: 13, marginTop: 2 }}>{policies.length} policies · {policies.filter(p=>p.enabled).length} active</p>
+          </div>
+          <button className="btn btn-primary" onClick={openNew}><Plus size={14} /> New policy</button>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {policies.map(p => (
+            <div key={p.id} className="card" style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', gap: 16, opacity: p.enabled ? 1 : 0.5, cursor: 'pointer', transition: 'border-color 0.15s' }}
+              onClick={() => openEdit(p)}>
+              {/* Category dot */}
+              <div style={{ width: 4, height: 40, borderRadius: 2, background: CATEGORY_COLOR[p.category] || 'var(--text-3)', flexShrink: 0 }} />
+
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                  <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text)' }}>{p.name}</span>
+                  <span className={`badge ${SEVERITY_CLASS[p.severity]}`}>{p.severity}</span>
+                  <span style={{ fontSize: 11, color: CATEGORY_COLOR[p.category], fontFamily: 'var(--font-mono)', background: `${CATEGORY_COLOR[p.category]}18`, padding: '2px 7px', borderRadius: 4 }}>
+                    {p.category}
+                  </span>
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                  {p.description || p.resource_type} · {p.grace_period_hours}h grace period
+                  {p.schedule && <> · <span style={{ fontFamily: 'var(--font-mono)' }}>{p.schedule}</span></>}
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', align: 'center', gap: 8 }} onClick={e => e.stopPropagation()}>
+                <button className="btn btn-ghost" style={{ padding: '5px 8px' }} onClick={() => doToggle(p.id)}>
+                  {p.enabled ? <ToggleRight size={15} color="var(--accent)" /> : <ToggleLeft size={15} />}
+                </button>
+                <button className="btn btn-ghost" style={{ padding: '5px 8px' }} onClick={() => openEdit(p)}><Edit2 size={13} /></button>
+                <button className="btn btn-danger" style={{ padding: '5px 8px' }} onClick={() => doDelete(p.id)}><Trash2 size={13} /></button>
+              </div>
+              <ChevronRight size={14} color="var(--text-3)" />
+            </div>
+          ))}
+          {!policies.length && (
+            <div style={{ textAlign: 'center', padding: '60px 0', color: 'var(--text-3)' }}>
+              No policies yet. Create one to start scanning.
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Editor panel */}
+      {editing && (
+        <div className="card" style={{ width: 460, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ fontFamily: 'var(--font-display)', fontWeight: 600, fontSize: 15 }}>
+              {editing === 'new' ? 'New policy' : 'Edit policy'}
+            </span>
+            <button className="btn btn-ghost" style={{ padding: '4px 8px' }} onClick={close}><X size={14} /></button>
+          </div>
+
+          <div style={{ flex: 1, overflow: 'auto', padding: 20 }}>
+            <Field label="Name">
+              <input value={form.name} onChange={e => setForm(f => ({...f, name: e.target.value}))} placeholder="idle-vm-notify" />
+            </Field>
+            <Field label="Description">
+              <input value={form.description || ''} onChange={e => setForm(f => ({...f, description: e.target.value}))} placeholder="Short description" />
+            </Field>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <Field label="Resource type">
+                <select value={form.resource_type} onChange={e => setForm(f => ({...f, resource_type: e.target.value}))}>
+                  {['azure.vm','azure.disk','azure.publicip','azure.sqldatabase','azure.storage','azure.appserviceplan','azure.resourcegroup'].map(r => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Category">
+                <select value={form.category} onChange={e => setForm(f => ({...f, category: e.target.value}))}>
+                  {['idle','orphaned','right-size','tagging','storage'].map(c => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Severity">
+                <select value={form.severity} onChange={e => setForm(f => ({...f, severity: e.target.value}))}>
+                  {['low','medium','high','critical'].map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </Field>
+              <Field label="Grace period (hours)">
+                <input type="number" value={form.grace_period_hours} min={1} max={720}
+                  onChange={e => setForm(f => ({...f, grace_period_hours: parseInt(e.target.value)}))} />
+              </Field>
+            </div>
+            <Field label="Schedule (cron, optional)">
+              <input value={form.schedule || ''} onChange={e => setForm(f => ({...f, schedule: e.target.value}))} placeholder="0 2 * * *" />
+            </Field>
+            <Field label="Policy YAML">
+              <textarea
+                value={form.yaml_content}
+                onChange={e => setForm(f => ({...f, yaml_content: e.target.value}))}
+                style={{ height: 280, fontFamily: 'var(--font-mono)', fontSize: 12, resize: 'vertical', lineHeight: 1.5 }}
+              />
+            </Field>
+          </div>
+
+          <div style={{ padding: '14px 20px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8 }}>
+            <button className="btn btn-primary" onClick={save} disabled={saving} style={{ flex: 1 }}>
+              <Save size={13} /> {saving ? 'Saving…' : 'Save policy'}
+            </button>
+            <button className="btn btn-ghost" onClick={close}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

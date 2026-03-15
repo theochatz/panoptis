@@ -1,0 +1,145 @@
+import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { fetchRuns, cancelRun, fetchPolicies, fetchSubscriptions, triggerRuns } from '../../lib/api'
+import { format } from 'date-fns'
+import { Play, X, RefreshCw, ChevronDown } from 'lucide-react'
+import toast from 'react-hot-toast'
+import { useState } from 'react'
+
+const STATUS_COLOR = {
+  completed: 'var(--green)', running: 'var(--accent)',
+  failed: 'var(--red)', pending: 'var(--amber)', cancelled: 'var(--text-3)',
+}
+
+export default function RunsPage() {
+  const qc = useQueryClient()
+  const [showTrigger, setShowTrigger] = useState(false)
+  const [selectedPolicies, setSelectedPolicies] = useState([])
+  const [selectedSubs, setSelectedSubs] = useState([])
+
+  const { data: runs = [], isFetching } = useQuery('runs-all', () => fetchRuns(200))
+  const { data: policies = [] } = useQuery('policies', fetchPolicies)
+  const { data: subscriptions = [] } = useQuery('subscriptions', fetchSubscriptions)
+
+  const doCancel = async (id) => {
+    try { await cancelRun(id); qc.invalidateQueries('runs-all'); toast.success('Run cancelled') }
+    catch { toast.error('Cancel failed') }
+  }
+
+  const doTrigger = async () => {
+    const ids = selectedPolicies.length ? selectedPolicies : policies.filter(p => p.enabled).map(p => p.id)
+    const subs = selectedSubs.length ? selectedSubs : undefined
+    try {
+      const res = await triggerRuns({ policy_ids: ids, subscription_ids: subs })
+      toast.success(`Spawned ${res.spawned} runs`)
+      qc.invalidateQueries('runs-all')
+      setShowTrigger(false)
+    } catch { toast.error('Trigger failed') }
+  }
+
+  const grouped = runs.reduce((acc, r) => { acc[r.status] = (acc[r.status] || 0) + 1; return acc }, {})
+
+  return (
+    <div style={{ padding: '28px 32px' }} className="fade-in">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24 }}>
+        <div>
+          <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 24, fontWeight: 700, marginBottom: 4 }}>Policy Runs</h1>
+          <div style={{ display: 'flex', gap: 16 }}>
+            {Object.entries(grouped).map(([s, c]) => (
+              <span key={s} style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: STATUS_COLOR[s] }}>
+                {c} {s}
+              </span>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {isFetching && <RefreshCw size={13} color="var(--text-3)" style={{ animation: 'spin 1s linear infinite' }} />}
+          <button className="btn btn-primary" onClick={() => setShowTrigger(!showTrigger)}>
+            <Play size={13} /> Trigger runs <ChevronDown size={12} />
+          </button>
+        </div>
+      </div>
+
+      {/* Trigger panel */}
+      {showTrigger && (
+        <div className="card" style={{ padding: 20, marginBottom: 20 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+            <div>
+              <label>Policies (leave empty for all enabled)</label>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 160, overflowY: 'auto', marginTop: 4 }}>
+                {policies.map(p => (
+                  <label key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 8, textTransform: 'none', letterSpacing: 0, cursor: 'pointer', marginBottom: 0 }}>
+                    <input type="checkbox" style={{ width: 'auto' }} checked={selectedPolicies.includes(p.id)}
+                      onChange={e => setSelectedPolicies(prev => e.target.checked ? [...prev, p.id] : prev.filter(x => x !== p.id))} />
+                    <span style={{ fontSize: 13, color: 'var(--text)' }}>{p.name}</span>
+                    {!p.enabled && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>(disabled)</span>}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div>
+              <label>Subscriptions (leave empty for all enabled)</label>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 160, overflowY: 'auto', marginTop: 4 }}>
+                {subscriptions.map(s => (
+                  <label key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, textTransform: 'none', letterSpacing: 0, cursor: 'pointer', marginBottom: 0 }}>
+                    <input type="checkbox" style={{ width: 'auto' }} checked={selectedSubs.includes(s.subscription_id)}
+                      onChange={e => setSelectedSubs(prev => e.target.checked ? [...prev, s.subscription_id] : prev.filter(x => x !== s.subscription_id))} />
+                    <span style={{ fontSize: 13, color: 'var(--text)' }}>{s.name}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-primary" onClick={doTrigger}><Play size={13} /> Launch</button>
+            <button className="btn btn-ghost" onClick={() => setShowTrigger(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Runs table */}
+      <div className="card">
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              {['Status', 'Run ID', 'Policy ID', 'Subscription', 'Resources', 'Waste/mo', 'Created', 'Actions'].map(h => (
+                <th key={h} style={{ textAlign: 'left', padding: '10px 14px', fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', borderBottom: '1px solid var(--border)' }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {runs.map(run => (
+              <tr key={run.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                <td style={{ padding: '10px 14px' }}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: STATUS_COLOR[run.status], fontFamily: 'var(--font-mono)' }}>
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: STATUS_COLOR[run.status], flexShrink: 0 }} className={run.status === 'running' ? 'pulse-dot' : ''} />
+                    {run.status}
+                  </span>
+                </td>
+                <td style={{ padding: '10px 14px', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-3)' }}>{run.id?.slice(0,14)}…</td>
+                <td style={{ padding: '10px 14px', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-3)' }}>{run.policy_id?.slice(0,14)}…</td>
+                <td style={{ padding: '10px 14px', fontSize: 12, color: 'var(--text-2)' }}>{run.subscription_id?.slice(0,24)}{run.subscription_id?.length > 24 ? '…' : ''}</td>
+                <td style={{ padding: '10px 14px', fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--text)' }}>{run.resources_found ?? '—'}</td>
+                <td style={{ padding: '10px 14px', fontFamily: 'var(--font-mono)', fontSize: 13, color: run.estimated_monthly_waste > 0 ? 'var(--red)' : 'var(--text-3)' }}>
+                  {run.estimated_monthly_waste ? `£${Math.round(run.estimated_monthly_waste)}` : '—'}
+                </td>
+                <td style={{ padding: '10px 14px', fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                  {run.created_at ? format(new Date(run.created_at), 'dd MMM HH:mm') : '—'}
+                </td>
+                <td style={{ padding: '10px 14px' }}>
+                  {['running', 'pending'].includes(run.status) && (
+                    <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: 11 }} onClick={() => doCancel(run.id)}>
+                      <X size={11} /> cancel
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {!runs.length && (
+              <tr><td colSpan={8} style={{ padding: '32px', textAlign: 'center', color: 'var(--text-3)' }}>No runs yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}

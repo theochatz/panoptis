@@ -1,0 +1,114 @@
+import { useQuery, useQueryClient } from 'react-query'
+import { fetchActions } from '../../lib/api'
+import { format } from 'date-fns'
+import { CheckCircle, XCircle, Clock, Loader, Zap } from 'lucide-react'
+
+const STATUS_ICON = {
+  completed: <CheckCircle size={14} color="var(--green)" />,
+  failed:    <XCircle size={14} color="var(--red)" />,
+  pending:   <Clock size={14} color="var(--amber)" />,
+  running:   <Loader size={14} color="var(--accent)" style={{ animation: 'spin 1s linear infinite' }} />,
+}
+const ACTION_COLOR = {
+  deallocate: 'var(--purple)', delete: 'var(--red)', tag: 'var(--amber)',
+  snapshot: 'var(--accent)', tier_down: 'var(--green)', resize: 'var(--accent)',
+}
+
+export default function ActionsPage() {
+  const { data: actions = [], isFetching } = useQuery('actions', fetchActions)
+
+  const byStatus = actions.reduce((a, r) => { a[r.status] = (a[r.status]||0)+1; return a }, {})
+
+  return (
+    <div style={{ padding: '28px 32px' }} className="fade-in">
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 24, fontWeight: 700, marginBottom: 4 }}>Remediation Actions</h1>
+        <div style={{ display: 'flex', gap: 20 }}>
+          {Object.entries(byStatus).map(([s, c]) => (
+            <span key={s} style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: s === 'completed' ? 'var(--green)' : s === 'failed' ? 'var(--red)' : 'var(--text-2)' }}>
+              {c} {s}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 24 }}>
+        {[
+          { label: 'Completed', count: byStatus.completed||0, color: 'var(--green)' },
+          { label: 'Running',   count: byStatus.running||0,   color: 'var(--accent)' },
+          { label: 'Pending',   count: byStatus.pending||0,   color: 'var(--amber)' },
+          { label: 'Failed',    count: byStatus.failed||0,    color: 'var(--red)' },
+        ].map(({ label, count, color }) => (
+          <div key={label} className="card" style={{ padding: '16px 18px' }}>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', marginBottom: 8 }}>{label}</div>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 28, fontWeight: 700, color }}>{count}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Actions table */}
+      <div className="card" style={{ overflow: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              {['Status', 'Action', 'Resource', 'Subscription', 'By', 'Result', 'Time'].map(h => (
+                <th key={h} style={{ textAlign: 'left', padding: '10px 14px', fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '0.06em', borderBottom: '1px solid var(--border)' }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {actions.map(a => (
+              <tr key={a.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                <td style={{ padding: '10px 14px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    {STATUS_ICON[a.status] || <Clock size={14} color="var(--text-3)" />}
+                    <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>{a.status}</span>
+                  </div>
+                </td>
+                <td style={{ padding: '10px 14px' }}>
+                  <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: ACTION_COLOR[a.action_type] || 'var(--text-2)',
+                    background: `${ACTION_COLOR[a.action_type] || 'var(--text-3)'}18`, padding: '2px 8px', borderRadius: 4 }}>
+                    {a.action_type}
+                  </span>
+                </td>
+                <td style={{ padding: '10px 14px' }}>
+                  <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{a.resource_name || '—'}</div>
+                  <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>{a.resource_id?.slice(0, 40)}…</div>
+                </td>
+                <td style={{ padding: '10px 14px', fontSize: 12, color: 'var(--text-2)' }}>
+                  {a.subscription_id?.slice(0, 22)}…
+                </td>
+                <td style={{ padding: '10px 14px' }}>
+                  <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)',
+                    color: a.initiated_by === 'manual' ? 'var(--accent)' : 'var(--text-3)',
+                    background: a.initiated_by === 'manual' ? 'rgba(0,212,255,0.1)' : 'var(--bg-2)',
+                    padding: '2px 7px', borderRadius: 4 }}>
+                    {a.initiated_by}
+                  </span>
+                </td>
+                <td style={{ padding: '10px 14px', fontSize: 12, color: a.error ? 'var(--red)' : 'var(--text-2)' }}>
+                  {a.error
+                    ? <span title={a.error}>Error: {a.error.slice(0, 40)}…</span>
+                    : a.result
+                      ? <span style={{ color: 'var(--green)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+                          {typeof a.result === 'object' ? JSON.stringify(a.result).slice(0, 50) : a.result}
+                        </span>
+                      : '—'}
+                </td>
+                <td style={{ padding: '10px 14px', fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>
+                  {a.created_at ? format(new Date(a.created_at), 'dd MMM HH:mm') : '—'}
+                </td>
+              </tr>
+            ))}
+            {!actions.length && (
+              <tr><td colSpan={7} style={{ padding: '40px', textAlign: 'center', color: 'var(--text-3)' }}>
+                {isFetching ? 'Loading…' : 'No remediation actions yet.'}
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
